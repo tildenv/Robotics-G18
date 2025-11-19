@@ -857,7 +857,8 @@ class RobotController:
         camera_coords_homogeneous = np.append(camera_coords, 1.0)
         
         # Transform to base frame
-        base_coords_homogeneous = T_base_camera @ camera_coords_homogeneous
+        # base_coords_homogeneous = T_base_camera @ camera_coords_homogeneous
+        base_coords_homogeneous = T_base_stylus @ camera_coords_homogeneous
         
         # Return 3D coordinates (drop homogeneous coordinate)
         return base_coords_homogeneous[:3]

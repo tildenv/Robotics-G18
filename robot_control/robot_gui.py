@@ -197,6 +197,10 @@ class RobotGUI(QMainWindow):
         home_btn.clicked.connect(lambda: self.set_preset([0.0, 0.0, 0.0, 0.0]))
         preset_layout.addWidget(home_btn)
         
+        home_pos_btn = QPushButton("Home Position")
+        home_pos_btn.clicked.connect(lambda: self.set_preset([0.0, np.pi/2, -np.pi/2, -np.pi/2]))
+        preset_layout.addWidget(home_pos_btn)
+        
         preset_1_btn = QPushButton("Preset 1")
         preset_1_btn.clicked.connect(lambda: self.set_preset([-np.pi/2, np.pi/2, np.pi/2, 0.0]))
         preset_layout.addWidget(preset_1_btn)
@@ -506,7 +510,7 @@ class RobotGUI(QMainWindow):
         camera_control_layout.addWidget(QLabel("Camera Device:"))
         self.camera_device_spinbox = QSpinBox()
         self.camera_device_spinbox.setRange(0, 10)
-        self.camera_device_spinbox.setValue(2)
+        self.camera_device_spinbox.setValue(3)
         camera_control_layout.addWidget(self.camera_device_spinbox)
         
         detect_btn = QPushButton("Detect Cameras")
@@ -1268,14 +1272,18 @@ class RobotGUI(QMainWindow):
             # Step 2: Build 3D point in camera frame
             # Due to the camera's physical mounting orientation, we need to swap coordinates
             # The rotation matrix shows the camera frame is rotated relative to the stylus frame
-            camera_coords = np.array([camera_height, wx, wy])
+            camera_coords = np.array([camera_height, -wy, wx])
+            # camera_coords = np.array([camera_height, 0, 0])
             
             print(f"Camera frame coords: {camera_coords}")
             self.log(f"  Object in camera frame: ({camera_height:.1f}, {wy:.1f}, {wx:.1f}) mm")
             
             # Step 3: Transform from camera frame to base frame using the kinematic chain
             base_coords = self.robot.camera_to_base_frame(camera_coords)
+            base_coords[1] = -1*base_coords[1]
+
             print(f"Base frame coords: {base_coords}")
+            # return
             if base_coords is None:
                 self.log("Failed to transform coordinates to base frame!")
                 return
@@ -1286,7 +1294,7 @@ class RobotGUI(QMainWindow):
             # But base_coords[2] might not be 0 due to transformation issues
             # Let's set Z=0 for table surface, then add 20mm hover offset
             table_z = 0.0
-            target_z = table_z + 20.0  # 20mm above table
+            target_z = table_z+20.0  # 20mm above table
             
             # Use XY from transformation, but override Z to be just above table
             base_coords[2] = target_z
