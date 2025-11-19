@@ -32,6 +32,72 @@ from datetime import datetime
 from object_detection import ObjectDetector
 
 
+def solve_quintic_coeffs(t_start, t_end, y_constraints):
+    """Solve for quintic polynomial coefficients given boundary conditions."""
+    tA = t_start
+    tB = t_end
+    
+    M = np.array([
+        [1, tA, tA**2, tA**3, tA**4, tA**5],
+        [0, 1, 2*tA, 3*tA**2, 4*tA**3, 5*tA**4],
+        [0, 0, 2, 6*tA, 12*tA**2, 20*tA**3],
+        [1, tB, tB**2, tB**3, tB**4, tB**5],
+        [0, 1, 2*tB, 3*tB**2, 4*tB**3, 5*tB**4],
+        [0, 0, 2, 6*tB, 12*tB**2, 20*tB**3]
+    ])
+    
+    c = np.linalg.solve(M, y_constraints)
+    return c
+
+
+def eval_quintic(coeffs, t):
+    """Evaluate a quintic polynomial at time t."""
+    return coeffs[0] + coeffs[1]*t + coeffs[2]*t**2 + coeffs[3]*t**3 + coeffs[4]*t**4 + coeffs[5]*t**5
+
+
+def generate_smooth_point_to_point(q_start, q_end, duration=1.0, dt=0.04):
+    """Generate smooth trajectory between two joint configurations using quintic polynomials.
+    
+    Args:
+        q_start: Starting joint configuration [q1, q2, q3, q4] in radians
+        q_end: Ending joint configuration [q1, q2, q3, q4] in radians
+        duration: Movement duration in seconds
+        dt: Time step in seconds
+        
+    Returns:
+        List of joint configurations (trajectory waypoints)
+    """
+    q_start = np.array(q_start)
+    q_end = np.array(q_end)
+    
+    # Boundary conditions: start and end at rest (zero velocity and acceleration)
+    trajectory = []
+    
+    # Compute polynomial coefficients for each joint
+    all_coeffs = []
+    for j in range(4):
+        y_constraints = [
+            q_start[j],  # q(t_start)
+            0.0,         # qd(t_start) - zero velocity
+            0.0,         # qdd(t_start) - zero acceleration
+            q_end[j],    # q(t_end)
+            0.0,         # qd(t_end) - zero velocity
+            0.0          # qdd(t_end) - zero acceleration
+        ]
+        coeffs = solve_quintic_coeffs(0.0, duration, y_constraints)
+        all_coeffs.append(coeffs)
+    
+    # Generate trajectory points
+    t_array = np.arange(0, duration + dt, dt)
+    for t in t_array:
+        if t > duration:
+            t = duration
+        q_vec = np.array([eval_quintic(all_coeffs[j], t) for j in range(4)])
+        trajectory.append(q_vec)
+    
+    return trajectory
+
+
 class RobotGUI(QMainWindow):
     """Main GUI window for robot control."""
     
@@ -1256,7 +1322,7 @@ class RobotGUI(QMainWindow):
         self.detection_index_spinbox.setRange(1, len(self.current_detections))
     
     def move_to_all_detections(self):
-        """Capture all current detections and move to them sequentially."""
+        """Capture all current detections and move to them sequentially using smooth trajectories."""
         if not self.robot or not self.robot.is_initialized:
             print("Robot not connected or initialized!")
             QMessageBox.warning(self, "Not Connected", "Please connect and initialize the robot first.")
@@ -1274,13 +1340,20 @@ class RobotGUI(QMainWindow):
         # Capture current detections (freeze them)
         self.saved_detections = list(self.current_detections)
         print(f"\nCaptured {len(self.saved_detections)} detection(s) for sequential movement")
+        print("Using smooth quintic polynomial trajectories for motion\n")
         
         # Define home position [0, 90, -90, -90] degrees
-        home_position = [0.0, np.pi/2, -np.pi/2, -np.pi/2]
+        home_position = np.array([0.0, np.pi/2, -np.pi/2, -np.pi/2])
+        
+        # Get current position
+        current_q = self.robot.get_joint_positions()
+        if current_q is None:
+            print("Failed to read current position!")
+            return
         
         # Move to each detection sequentially
         for idx, detection in enumerate(self.saved_detections):
-            print(f"\n--- Moving to detection #{idx + 1}/{len(self.saved_detections)} ---")
+            print(f"--- Moving to detection #{idx + 1}/{len(self.saved_detections)} ---")
             
             try:
                 # Use position reconstructor to get target position
@@ -1300,35 +1373,72 @@ class RobotGUI(QMainWindow):
                 debug_str = self.position_reconstructor.format_debug_info(debug_info, idx + 1)
                 print(debug_str)
                 
-                # Move robot to target position using IK (with wait=True for sequential movement)
-                if self.robot.move_to_position(
+                # Compute IK for target position
+                solutions = self.robot.inverse_kinematics(
                     target_position[0], 
                     target_position[1], 
                     target_position[2], 
-                    x4z_desired=-1.0, 
-                    prefer_elbow_up=True, 
-                    wait=True  # Wait for this movement to complete before moving to next
-                ):
-                    print(f"Successfully moved to detection #{idx + 1}")
-                    time.sleep(2.0)  # Wait 2 seconds at detection position
-                    
-                    # Return to home position between detections
-                    print(f"Returning to home position...")
-                    if self.robot.set_joint_positions(home_position, wait=True):
-                        print(f"Returned to home position")
-                        time.sleep(2.0)  # Wait 2 seconds at home position
-                    else:
-                        print(f"Warning: Failed to return to home position")
-                else:
-                    print(f"Failed to move to detection #{idx + 1} (position may be unreachable)")
-                    
+                    x4z_desired=-1.0
+                )
+                
+                if not solutions:
+                    print(f"No IK solution for detection #{idx + 1}, skipping...")
+                    continue
+                
+                # Select elbow-up solution (highest q2)
+                solutions_with_idx = [(i, sol, sol[1]) for i, sol in enumerate(solutions)]
+                solutions_with_idx.sort(key=lambda x: x[2], reverse=True)
+                target_q = solutions_with_idx[0][1]
+                
+                print(f"Generating smooth trajectory from current position to detection #{idx + 1}...")
+                
+                # Generate smooth trajectory from current position to target
+                trajectory_to_target = generate_smooth_point_to_point(
+                    current_q, target_q, duration=2.0, dt=0.04
+                )
+                
+                # Execute trajectory to target
+                print(f"Executing trajectory to detection #{idx + 1} ({len(trajectory_to_target)} waypoints)...")
+                for waypoint in trajectory_to_target:
+                    self.robot.set_joint_positions(list(waypoint), wait=False)
+                    time.sleep(0.04)
+                
+                print(f"Reached detection #{idx + 1}")
+                time.sleep(2.0)  # Pause at detection
+                
+                # Update current position
+                current_q = self.robot.get_joint_positions()
+                if current_q is None:
+                    print("Failed to read current position!")
+                    break
+                
+                # Generate smooth trajectory back to home
+                print(f"Generating smooth trajectory back to home position...")
+                trajectory_to_home = generate_smooth_point_to_point(
+                    current_q, home_position, duration=2.0, dt=0.04
+                )
+                
+                # Execute trajectory to home
+                print(f"Executing trajectory to home ({len(trajectory_to_home)} waypoints)...")
+                for waypoint in trajectory_to_home:
+                    self.robot.set_joint_positions(list(waypoint), wait=False)
+                    time.sleep(0.04)
+                
+                print(f"Returned to home position")
+                time.sleep(2.0)  # Pause at home
+                
+                # Update current position for next iteration
+                current_q = home_position
+                
             except Exception as e:
                 print(f"Error moving to detection #{idx + 1}: {str(e)}")
+                import traceback
+                traceback.print_exc()
                 continue
         
-        print(f"\nCompleted sequential movement to all {len(self.saved_detections)} detections")
+        print(f"\nCompleted smooth trajectory movement to all {len(self.saved_detections)} detections")
         QMessageBox.information(self, "Movement Complete", 
-            f"Successfully processed {len(self.saved_detections)} detection(s)")
+            f"Successfully processed {len(self.saved_detections)} detection(s) using smooth trajectories")
     
     def move_to_detection(self):
         """Move the robot stylus to a detected object position."""
