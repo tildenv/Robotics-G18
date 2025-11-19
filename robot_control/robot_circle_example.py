@@ -10,7 +10,7 @@ import time
 import math
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-from robot_control.robot_controller import RobotController
+from robot_controller import RobotController
 
 
 def forward_kin_numeric(q, robot):
@@ -259,7 +259,6 @@ def generate_smooth_trajectory(configs, segment_duration=2.0):
     # This converts the desired Cartesian velocities to joint space
     # Note: We need a robot instance for DH parameters
     # Create a temporary controller just for kinematics (no connection needed)
-    from robot_control.robot_controller import RobotController
     temp_robot = RobotController()
     
     qd_knots = []

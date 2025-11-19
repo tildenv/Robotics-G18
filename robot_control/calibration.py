@@ -14,7 +14,7 @@ file_extension = '*.jpg' # Change to *.png or *.jpeg if necessary
 # NOTE: Verify this matches YOUR checkerboard! Count internal corners, not squares.
 # IMPORTANT: Try different combinations if detection fails: (6,4), (7,9), (8,6), etc.
 CHECKERBOARD = (5, 4)  # (width, height) in corners - SWAPPED to try alternate orientation
-SQUARE_SIZE = 25.0  # Square size in mm (measure your actual checkerboard)
+SQUARE_SIZE = 15.0  # Square size in mm (measure your actual checkerboard)
 
 # --- SETUP ---
 # Termination criteria for corner refinement

@@ -39,7 +39,8 @@ class RobotController:
     TORQUE_DISABLE = 0
     
     # Robot DH parameters (in mm)
-    L1 = 50.0   # base offset (d1)
+    STAND_HEIGHT = 47.0  # height of the stand from ground
+    L1 = 50.0 + STAND_HEIGHT  # base offset (d1) = robot base height + stand height
     L2 = 93.0   # link 2 length (a2)
     L3 = 93.0   # link 3 length (a3)
     L4 = 50.0   # link 4 length (a4)
@@ -485,9 +486,10 @@ class RobotController:
     
     def move_to_position(self, x: float, y: float, z: float,
                         x4z_desired: float = 0.0,
-                        solution_index: int = 0,
+                        solution_index: int = None,
                         wait: bool = True,
-                        timeout: float = 5.0) -> bool:
+                        timeout: float = 5.0,
+                        prefer_elbow_up: bool = True) -> bool:
         """
         Move robot end-effector to a target Cartesian position using IK.
         
@@ -496,9 +498,12 @@ class RobotController:
             y: Target Y position (mm)
             z: Target Z position (mm)
             x4z_desired: Desired z-component of x4 axis orientation (default: 0.0)
-            solution_index: Which IK solution to use (0-3, if multiple exist)
+            solution_index: Which IK solution to use. If None and prefer_elbow_up=True,
+                          automatically selects "Elbow Up" configuration (highest q2)
             wait: Wait until motors reach target positions
             timeout: Maximum time to wait (seconds)
+            prefer_elbow_up: If True and solution_index is None, automatically select
+                           the solution with highest shoulder angle (q2) for "Elbow Up"
             
         Returns:
             bool: True if successful, False if position unreachable or error occurred
@@ -511,16 +516,33 @@ class RobotController:
             print(f"Error: Position ({x}, {y}, {z}) is unreachable!")
             return False
         
-        if solution_index >= len(solutions):
-            print(f"Warning: Solution index {solution_index} not available. Using solution 0.")
-            solution_index = 0
-            print(len(solutions))
-        
-        # Get the desired joint angles in radians
-        q_radians = solutions[solution_index]
+        # Select solution based on strategy
+        if solution_index is None and prefer_elbow_up:
+            # Automatically select "Elbow Up" configuration
+            # Sort solutions by q2 (shoulder joint) in descending order
+            # The highest q2 value gives the "Elbow Up" configuration
+            solutions_with_idx = [(i, sol, sol[1]) for i, sol in enumerate(solutions)]  # (index, solution, q2_value)
+            solutions_with_idx.sort(key=lambda x: x[2], reverse=True)  # Sort by q2 descending
+            
+            selected_idx = solutions_with_idx[0][0]  # Index of solution with highest q2
+            q_radians = solutions_with_idx[0][1]  # Take solution with highest q2
+            
+            print(f"Auto-selected 'Elbow Up' configuration (solution {selected_idx})")
+            print(f"  Shoulder angle (q2): {np.degrees(q_radians[1]):.2f}°")
+        elif solution_index is not None:
+            # Use explicitly specified solution index
+            if solution_index >= len(solutions):
+                print(f"Warning: Solution index {solution_index} not available. Using solution 0.")
+                solution_index = 0
+            q_radians = solutions[solution_index]
+            selected_idx = solution_index
+        else:
+            # Default to first solution if no preference
+            q_radians = solutions[0]
+            selected_idx = 0
         
         print(f"Moving to position ({x:.1f}, {y:.1f}, {z:.1f}) mm")
-        print(f"Using IK solution {solution_index}: q = {np.round(np.degrees(q_radians), 2)} degrees")
+        print(f"Using IK solution {selected_idx}: q = {np.round(np.degrees(q_radians), 2)} degrees")
         
         # Send positions to motors (now accepts radians directly)
         return self.set_joint_positions(list(q_radians), wait=wait, timeout=timeout)
@@ -767,7 +789,7 @@ class RobotController:
         # Transformation from stylus to camera (A5)
         T_stylus_camera = np.array([
             [1, 0, 0, -15],
-            [0, 1, 0, 45],
+            [0, 1, 0, 20],
             [0, 0, 1, 0],
             [0, 0, 0, 1]
         ], dtype=float)
@@ -845,7 +867,7 @@ class RobotController:
         # Transformation from stylus to camera (A5)
         T_stylus_camera = np.array([
             [1, 0, 0, -15],
-            [0, 1, 0, 45],
+            [0, 1, 0, 20],
             [0, 0, 1, 0],
             [0, 0, 0, 1]
         ], dtype=float)
@@ -857,8 +879,8 @@ class RobotController:
         camera_coords_homogeneous = np.append(camera_coords, 1.0)
         
         # Transform to base frame
-        # base_coords_homogeneous = T_base_camera @ camera_coords_homogeneous
-        base_coords_homogeneous = T_base_stylus @ camera_coords_homogeneous
+        base_coords_homogeneous = T_base_camera @ camera_coords_homogeneous
+        # base_coords_homogeneous = T_base_stylus @ camera_coords_homogeneous
         
         # Return 3D coordinates (drop homogeneous coordinate)
         return base_coords_homogeneous[:3]

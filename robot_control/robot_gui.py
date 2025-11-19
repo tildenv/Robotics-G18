@@ -22,7 +22,9 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QImage, QPixmap
 from robot_controller import RobotController
+from position_reconstruction import PositionReconstructor
 import math
+import time
 # Import cv2 with headless backend to avoid Qt conflicts
 os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
 import cv2
@@ -36,12 +38,14 @@ class RobotGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.robot = None
+        self.position_reconstructor = None
         self.realtime_update_enabled = False
         self.camera = None
         self.camera_active = False
         self.detector = ObjectDetector(calibration_file='./photos/camera_calibration_data.npz')
         self.detection_enabled = False
         self.current_detections = []
+        self.saved_detections = []  # Store detections for sequential movement
         # Camera to stylus transformation (inverse of stylus to camera)
         # Original: T_stylus_camera = [[1,0,0,-15], [0,1,0,45], [0,0,1,0], [0,0,0,1]]
         # Inverted: T_camera_stylus
@@ -97,7 +101,7 @@ class RobotGUI(QMainWindow):
         log_group.setLayout(log_layout)
         main_layout.addWidget(log_group)
         
-        self.log("GUI initialized. Connect to robot to begin.")
+        print("GUI initialized. Connect to robot to begin.")
         
     def create_connection_group(self):
         """Create connection control group."""
@@ -472,6 +476,13 @@ class RobotGUI(QMainWindow):
         self.realtime_solution_spinbox.setValue(0)
         cartesian_slider_layout.addWidget(self.realtime_solution_spinbox, 4, 1)
         
+        # Elbow Up preference checkbox
+        from PyQt5.QtWidgets import QCheckBox
+        self.elbow_up_checkbox = QCheckBox("Prefer Elbow Up")
+        self.elbow_up_checkbox.setChecked(True)
+        self.elbow_up_checkbox.setToolTip("Automatically select solution with highest shoulder angle (keeps elbow high)")
+        cartesian_slider_layout.addWidget(self.elbow_up_checkbox, 5, 0, 1, 2)
+        
         cartesian_slider_group.setLayout(cartesian_slider_layout)
         layout.addWidget(cartesian_slider_group)
         
@@ -569,6 +580,11 @@ class RobotGUI(QMainWindow):
         move_to_detection_btn.clicked.connect(self.move_to_detection)
         move_detection_layout.addWidget(move_to_detection_btn)
         
+        move_all_btn = QPushButton("Capture & Move to All")
+        move_all_btn.clicked.connect(self.move_to_all_detections)
+        move_all_btn.setToolTip("Capture current detections and move to each one sequentially")
+        move_detection_layout.addWidget(move_all_btn)
+        
         move_detection_layout.addStretch()
         detection_list_layout.addLayout(move_detection_layout)
         
@@ -622,7 +638,7 @@ class RobotGUI(QMainWindow):
     def toggle_realtime_control(self):
         """Enable or disable real-time control."""
         if not self.robot or not self.robot.is_initialized:
-            self.log("Robot not connected or initialized!")
+            print("Robot not connected or initialized!")
             QMessageBox.warning(self, "Not Connected", "Please connect and initialize the robot first.")
             return
         
@@ -631,12 +647,12 @@ class RobotGUI(QMainWindow):
         if self.realtime_update_enabled:
             self.realtime_enable_btn.setText("Disable Real-time Control")
             self.realtime_enable_btn.setStyleSheet("background-color: #ff6b6b;")
-            self.log("Real-time control ENABLED - Sliders will move robot immediately!")
+            print("Real-time control ENABLED - Sliders will move robot immediately!")
             self.sync_sliders_to_robot()
         else:
             self.realtime_enable_btn.setText("Enable Real-time Control")
             self.realtime_enable_btn.setStyleSheet("")
-            self.log("Real-time control DISABLED")
+            print("Real-time control DISABLED")
     
     def set_realtime_mode(self, mode):
         """Set the real-time control mode (joint or cartesian)."""
@@ -644,18 +660,18 @@ class RobotGUI(QMainWindow):
         if mode == 'joint':
             self.joint_mode_btn.setChecked(True)
             self.cartesian_mode_btn.setChecked(False)
-            self.log("Switched to Joint Mode")
+            print("Switched to Joint Mode")
         else:
             self.joint_mode_btn.setChecked(False)
             self.cartesian_mode_btn.setChecked(True)
-            self.log("Switched to Cartesian Mode")
+            print("Switched to Cartesian Mode")
             if self.realtime_update_enabled:
                 self.sync_cartesian_sliders_to_robot()
     
     def sync_sliders_to_robot(self):
         """Sync all sliders to current robot position."""
         if not self.robot or not self.robot.is_connected:
-            self.log("Robot not connected!")
+            print("Robot not connected!")
             return
         
         try:
@@ -672,9 +688,9 @@ class RobotGUI(QMainWindow):
                 # Sync cartesian sliders
                 self.sync_cartesian_sliders_to_robot()
                 
-                self.log("Sliders synchronized to robot position")
+                print("Sliders synchronized to robot position")
         except Exception as e:
-            self.log(f"Error syncing sliders: {str(e)}")
+            print(f"Error syncing sliders: {str(e)}")
     
     def sync_cartesian_sliders_to_robot(self):
         """Sync cartesian sliders to current end-effector position."""
@@ -710,7 +726,7 @@ class RobotGUI(QMainWindow):
                 self.z_slider.blockSignals(False)
                 self.x4z_slider.blockSignals(False)
         except Exception as e:
-            self.log(f"Error syncing cartesian sliders: {str(e)}")
+            print(f"Error syncing cartesian sliders: {str(e)}")
     
     def on_joint_slider_changed(self, joint_idx, value):
         """Handle joint slider changes."""
@@ -729,7 +745,7 @@ class RobotGUI(QMainWindow):
                 # Update cartesian sliders to reflect new position
                 QTimer.singleShot(100, self.sync_cartesian_sliders_to_robot)
             except Exception as e:
-                self.log(f"Error in real-time joint control: {str(e)}")
+                print(f"Error in real-time joint control: {str(e)}")
     
     def on_cartesian_slider_changed(self, axis, value):
         """Handle cartesian slider changes."""
@@ -753,21 +769,32 @@ class RobotGUI(QMainWindow):
                 z = self.z_slider.value()
                 x4z = self.x4z_slider.value() / 100.0
                 solution_idx = self.realtime_solution_spinbox.value()
+                prefer_elbow_up = self.elbow_up_checkbox.isChecked()
                 
                 # Compute IK and move
                 solutions = self.robot.inverse_kinematics(x, y, z, x4z_desired=x4z)
-                if solutions and solution_idx < len(solutions):
+                
+                # Select solution based on preference
+                if prefer_elbow_up and solutions:
+                    # Sort by q2 (shoulder) in descending order and take the first
+                    solutions_with_q2 = [(sol, sol[1]) for sol in solutions]
+                    solutions_with_q2.sort(key=lambda s: s[1], reverse=True)
+                    q_radians = solutions_with_q2[0][0]
+                elif solutions and solution_idx < len(solutions):
                     q_radians = solutions[solution_idx]
-                    self.robot.set_joint_positions(list(q_radians), wait=False)
+                else:
+                    return
                     
-                    # Update joint sliders to reflect new angles
-                    for i, angle in enumerate(q_radians):
-                        self.joint_sliders[i].blockSignals(True)
-                        self.joint_sliders[i].setValue(int(angle * 100))
-                        self.joint_slider_labels[i].setText(f"{angle:.2f} rad ({np.degrees(angle):.2f}°)")
-                        self.joint_sliders[i].blockSignals(False)
+                self.robot.set_joint_positions(list(q_radians), wait=False)
+                
+                # Update joint sliders to reflect new angles
+                for i, angle in enumerate(q_radians):
+                    self.joint_sliders[i].blockSignals(True)
+                    self.joint_sliders[i].setValue(int(angle * 100))
+                    self.joint_slider_labels[i].setText(f"{angle:.2f} rad ({np.degrees(angle):.2f}°)")
+                    self.joint_sliders[i].blockSignals(False)
             except Exception as e:
-                self.log(f"Error in real-time cartesian control: {str(e)}")
+                print(f"Error in real-time cartesian control: {str(e)}")
         
     def log(self, message):
         """Add message to log output."""
@@ -780,7 +807,7 @@ class RobotGUI(QMainWindow):
             baudrate = int(self.baudrate_input.text())
             motor_ids = [int(x.strip()) for x in self.motor_ids_input.text().split(',')]
             
-            self.log(f"Connecting to robot at {port}...")
+            print(f"Connecting to robot at {port}...")
             self.robot = RobotController(
                 port_name=port,
                 baudrate=baudrate,
@@ -789,57 +816,60 @@ class RobotGUI(QMainWindow):
             )
             
             if self.robot.connect():
-                self.log("Connected successfully!")
+                print("Connected successfully!")
                 if self.robot.initialize(compliance_margin=0, compliance_slope=32, moving_speed=50):
-                    self.log("Robot initialized successfully!")
+                    print("Robot initialized successfully!")
+                    # Create position reconstructor after robot is initialized
+                    self.position_reconstructor = PositionReconstructor(self.robot)
                     self.connect_btn.setEnabled(False)
                     self.disconnect_btn.setEnabled(True)
                     self.update_status()
                 else:
-                    self.log("Failed to initialize robot.")
+                    print("Failed to initialize robot.")
             else:
-                self.log("Failed to connect to robot.")
+                print("Failed to connect to robot.")
                 self.robot = None
                 
         except Exception as e:
-            self.log(f"Error connecting: {str(e)}")
+            print(f"Error connecting: {str(e)}")
             QMessageBox.critical(self, "Connection Error", str(e))
             
     def disconnect_robot(self):
         """Disconnect from the robot."""
         if self.robot:
-            self.log("Disconnecting from robot...")
+            print("Disconnecting from robot...")
             self.robot.disable_torque()
             self.robot.disconnect()
             self.robot = None
+            self.position_reconstructor = None
             self.connect_btn.setEnabled(True)
             self.disconnect_btn.setEnabled(False)
-            self.log("Disconnected.")
+            print("Disconnected.")
             
     def move_joints(self, wait=False):
         """Move robot to specified joint angles."""
         if not self.robot or not self.robot.is_initialized:
-            self.log("Robot not connected or initialized!")
+            print("Robot not connected or initialized!")
             return
             
         try:
             angles_deg = [spinbox.value() for spinbox in self.joint_spinboxes]
             angles_rad = [np.radians(deg) for deg in angles_deg]
-            self.log(f"Moving to joint angles: {[f'{a:.2f}°' for a in angles_deg]}")
+            print(f"Moving to joint angles: {[f'{a:.2f}°' for a in angles_deg]}")
             
             if self.robot.set_joint_positions(angles_rad, wait=wait):
-                self.log("Joint movement command sent successfully.")
+                print("Joint movement command sent successfully.")
             else:
-                self.log("Failed to send joint movement command.")
+                print("Failed to send joint movement command.")
                 
         except Exception as e:
-            self.log(f"Error moving joints: {str(e)}")
+            print(f"Error moving joints: {str(e)}")
             QMessageBox.critical(self, "Movement Error", str(e))
             
     def read_joint_angles(self):
         """Read current joint angles from robot."""
         if not self.robot or not self.robot.is_connected:
-            self.log("Robot not connected!")
+            print("Robot not connected!")
             return
             
         try:
@@ -848,24 +878,24 @@ class RobotGUI(QMainWindow):
                 angles_deg = [np.degrees(a) for a in angles_rad]
                 for i, (spinbox, angle_deg) in enumerate(zip(self.joint_spinboxes, angles_deg)):
                     spinbox.setValue(angle_deg)
-                self.log(f"Read joint angles: {[f'{a:.2f}°' for a in angles_deg]}")
+                print(f"Read joint angles: {[f'{a:.2f}°' for a in angles_deg]}")
             else:
-                self.log("Failed to read joint angles.")
+                print("Failed to read joint angles.")
                 
         except Exception as e:
-            self.log(f"Error reading joint angles: {str(e)}")
+            print(f"Error reading joint angles: {str(e)}")
             
     def set_preset(self, angles_rad):
         """Set spinboxes to preset angles (input in radians, converted to degrees for display)."""
         angles_deg = [np.degrees(a) for a in angles_rad]
         for spinbox, angle_deg in zip(self.joint_spinboxes, angles_deg):
             spinbox.setValue(angle_deg)
-        self.log(f"Set preset angles: {[f'{a:.2f}°' for a in angles_deg]}")
+        print(f"Set preset angles: {[f'{a:.2f}°' for a in angles_deg]}")
         
     def move_cartesian(self, wait=False):
         """Move robot to specified Cartesian position using IK."""
         if not self.robot or not self.robot.is_initialized:
-            self.log("Robot not connected or initialized!")
+            print("Robot not connected or initialized!")
             return
             
         try:
@@ -875,17 +905,17 @@ class RobotGUI(QMainWindow):
             x4z = self.x4z_spinbox.value()
             solution_idx = self.solution_spinbox.value()
             
-            self.log(f"Moving to position: ({x:.2f}, {y:.2f}, {z:.2f}) mm, x4z={x4z:.2f}, solution={solution_idx}")
+            print(f"Moving to position: ({x:.2f}, {y:.2f}, {z:.2f}) mm, x4z={x4z:.2f}, solution={solution_idx}")
             
             if self.robot.move_to_position(x, y, z, x4z_desired=x4z, solution_index=solution_idx, wait=wait):
-                self.log("Cartesian movement command sent successfully.")
+                print("Cartesian movement command sent successfully.")
                 # Update joint spinboxes
                 self.read_joint_angles()
             else:
-                self.log("Failed to send Cartesian movement command (position may be unreachable).")
+                print("Failed to send Cartesian movement command (position may be unreachable).")
                 
         except Exception as e:
-            self.log(f"Error moving to Cartesian position: {str(e)}")
+            print(f"Error moving to Cartesian position: {str(e)}")
             QMessageBox.critical(self, "Movement Error", str(e))
             
     def compute_ik_preview(self):
@@ -896,41 +926,41 @@ class RobotGUI(QMainWindow):
             z = self.z_spinbox.value()
             x4z = self.x4z_spinbox.value()
             
-            self.log(f"Computing IK for position: ({x:.2f}, {y:.2f}, {z:.2f}) mm, x4z={x4z:.2f}")
+            print(f"Computing IK for position: ({x:.2f}, {y:.2f}, {z:.2f}) mm, x4z={x4z:.2f}")
             
             # Use existing robot or create temporary one for IK calculation
             robot = self.robot if self.robot else RobotController()
             solutions = robot.inverse_kinematics(x, y, z, x4z_desired=x4z)
             
             if solutions:
-                self.log(f"Found {len(solutions)} IK solution(s):")
+                print(f"Found {len(solutions)} IK solution(s):")
                 for i, sol in enumerate(solutions):
-                    self.log(f"  Solution {i}: {[f'{np.degrees(a):.2f}°' for a in sol]}")
+                    print(f"  Solution {i}: {[f'{np.degrees(a):.2f}°' for a in sol]}")
             else:
-                self.log("No IK solutions found (position unreachable).")
+                print("No IK solutions found (position unreachable).")
                 
         except Exception as e:
-            self.log(f"Error computing IK: {str(e)}")
+            print(f"Error computing IK: {str(e)}")
             
     def compute_forward_kinematics(self):
         """Compute forward kinematics to get current end-effector position."""
         if not self.robot or not self.robot.is_connected:
-            self.log("Robot not connected!")
+            print("Robot not connected!")
             return
             
         try:
             pos, rot = self.robot.forward_kinematics()
             if pos is not None:
-                self.log(f"Current end-effector position: ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) mm")
+                print(f"Current end-effector position: ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) mm")
                 # Update spinboxes
                 self.x_spinbox.setValue(pos[0])
                 self.y_spinbox.setValue(pos[1])
                 self.z_spinbox.setValue(pos[2])
             else:
-                self.log("Failed to compute forward kinematics.")
+                print("Failed to compute forward kinematics.")
                 
         except Exception as e:
-            self.log(f"Error computing forward kinematics: {str(e)}")
+            print(f"Error computing forward kinematics: {str(e)}")
             
     def update_status(self):
         """Update status display."""
@@ -968,51 +998,51 @@ class RobotGUI(QMainWindow):
             
             status_text += "="*50
             self.status_display.setText(status_text)
-            self.log("Status updated.")
+            print("Status updated.")
             
         except Exception as e:
-            self.log(f"Error updating status: {str(e)}")
+            print(f"Error updating status: {str(e)}")
             
     def enable_torque(self):
         """Enable torque for all motors."""
         if not self.robot or not self.robot.is_connected:
-            self.log("Robot not connected!")
+            print("Robot not connected!")
             return
         
         try:
             self.robot.enable_torque()
-            self.log("Torque enabled for all motors.")
+            print("Torque enabled for all motors.")
         except Exception as e:
-            self.log(f"Error enabling torque: {str(e)}")
+            print(f"Error enabling torque: {str(e)}")
             
     def disable_torque(self):
         """Disable torque for all motors."""
         if not self.robot or not self.robot.is_connected:
-            self.log("Robot not connected!")
+            print("Robot not connected!")
             return
         
         try:
             self.robot.disable_torque()
-            self.log("Torque disabled for all motors.")
+            print("Torque disabled for all motors.")
         except Exception as e:
-            self.log(f"Error disabling torque: {str(e)}")
+            print(f"Error disabling torque: {str(e)}")
             
     def set_speed(self):
         """Set motor speed."""
         if not self.robot or not self.robot.is_connected:
-            self.log("Robot not connected!")
+            print("Robot not connected!")
             return
         
         try:
             speed = self.speed_spinbox.value()
             self.robot.set_speed(speed)
-            self.log(f"Speed set to {speed} for all motors.")
+            print(f"Speed set to {speed} for all motors.")
         except Exception as e:
-            self.log(f"Error setting speed: {str(e)}")
+            print(f"Error setting speed: {str(e)}")
             
     def detect_cameras(self):
         """Detect available camera devices."""
-        self.log("Detecting available cameras...")
+        print("Detecting available cameras...")
         available = []
         
         # Test camera indices 0-10
@@ -1023,13 +1053,13 @@ class RobotGUI(QMainWindow):
                 cap.release()
         
         if available:
-            self.log(f"Found {len(available)} camera(s): {available}")
+            print(f"Found {len(available)} camera(s): {available}")
             # Set to first available camera
             self.camera_device_spinbox.setValue(available[0])
             QMessageBox.information(self, "Cameras Detected", 
                 f"Found camera devices at indices: {available}\n\nCamera device selector updated to: {available[0]}")
         else:
-            self.log("No cameras detected")
+            print("No cameras detected")
             QMessageBox.warning(self, "No Cameras", "No camera devices were detected.")
     
     def open_camera(self):
@@ -1043,7 +1073,7 @@ class RobotGUI(QMainWindow):
                 self.camera = cv2.VideoCapture(device_id)
             
             if not self.camera.isOpened():
-                self.log(f"Failed to open camera (device {device_id})")
+                print(f"Failed to open camera (device {device_id})")
                 QMessageBox.warning(self, "Camera Error", 
                     f"Failed to open camera device {device_id}.\n\nTry clicking 'Detect Cameras' to find available devices.")
                 self.camera = None
@@ -1055,10 +1085,10 @@ class RobotGUI(QMainWindow):
             self.capture_btn.setEnabled(True)
             self.detection_toggle_btn.setEnabled(True)
             self.camera_timer.start(30)  # Update every 30ms (~33 FPS)
-            self.log("Camera opened successfully")
+            print("Camera opened successfully")
             
         except Exception as e:
-            self.log(f"Error opening camera: {str(e)}")
+            print(f"Error opening camera: {str(e)}")
             QMessageBox.critical(self, "Camera Error", str(e))
     
     def close_camera(self):
@@ -1078,10 +1108,10 @@ class RobotGUI(QMainWindow):
             self.detection_enabled = False
             self.detection_toggle_btn.setEnabled(False)
             self.detection_toggle_btn.setText("Enable Detection")
-            self.log("Camera closed")
+            print("Camera closed")
             
         except Exception as e:
-            self.log(f"Error closing camera: {str(e)}")
+            print(f"Error closing camera: {str(e)}")
     
     def update_camera_frame(self):
         """Update the camera preview frame."""
@@ -1146,18 +1176,18 @@ class RobotGUI(QMainWindow):
                 self.camera_preview_label.setPixmap(scaled_pixmap)
             
         except Exception as e:
-            self.log(f"Error updating camera frame: {str(e)}")
+            print(f"Error updating camera frame: {str(e)}")
     
     def take_photo(self):
         """Capture and save a photo from the camera."""
         if not self.camera_active or not self.camera:
-            self.log("Camera not active")
+            print("Camera not active")
             return
         
         try:
             ret, frame = self.camera.read()
             if not ret:
-                self.log("Failed to capture frame")
+                print("Failed to capture frame")
                 QMessageBox.warning(self, "Capture Error", "Failed to capture frame from camera")
                 return
             
@@ -1170,11 +1200,11 @@ class RobotGUI(QMainWindow):
             
             # Save the image
             cv2.imwrite(filename, frame)
-            self.log(f"Photo saved: {filename}")
+            print(f"Photo saved: {filename}")
             QMessageBox.information(self, "Photo Saved", f"Photo saved successfully:\n{filename}")
             
         except Exception as e:
-            self.log(f"Error taking photo: {str(e)}")
+            print(f"Error taking photo: {str(e)}")
             QMessageBox.critical(self, "Capture Error", str(e))
     
     def change_save_location(self):
@@ -1189,7 +1219,7 @@ class RobotGUI(QMainWindow):
         if directory:
             self.save_location = directory
             self.save_location_label.setText(f"Save to: {directory}")
-            self.log(f"Photo save location changed to: {directory}")
+            print(f"Photo save location changed to: {directory}")
     
     def toggle_detection(self):
         """Toggle object detection on/off."""
@@ -1198,11 +1228,11 @@ class RobotGUI(QMainWindow):
         if self.detection_enabled:
             self.detection_toggle_btn.setText("Disable Detection")
             self.detection_toggle_btn.setStyleSheet("background-color: #90EE90;")
-            self.log("Object detection ENABLED - Camera height will be automatically updated from robot position")
+            print("Object detection ENABLED - Camera height will be automatically updated from robot position")
         else:
             self.detection_toggle_btn.setText("Enable Detection")
             self.detection_toggle_btn.setStyleSheet("")
-            self.log("Object detection DISABLED")
+            print("Object detection DISABLED")
     
     def update_detection_list(self):
         """Update the detection list display."""
@@ -1225,93 +1255,143 @@ class RobotGUI(QMainWindow):
         self.detection_list.setText(text)
         self.detection_index_spinbox.setRange(1, len(self.current_detections))
     
-    def move_to_detection(self):
-        """Move the robot stylus to a detected object position."""
+    def move_to_all_detections(self):
+        """Capture all current detections and move to them sequentially."""
         if not self.robot or not self.robot.is_initialized:
-            self.log("Robot not connected or initialized!")
+            print("Robot not connected or initialized!")
             QMessageBox.warning(self, "Not Connected", "Please connect and initialize the robot first.")
             return
         
+        if not self.position_reconstructor:
+            print("Position reconstructor not initialized!")
+            return
+        
         if not self.current_detections:
-            self.log("No detections available!")
+            print("No detections available!")
+            QMessageBox.warning(self, "No Detections", "No objects detected. Enable detection first.")
+            return
+        
+        # Capture current detections (freeze them)
+        self.saved_detections = list(self.current_detections)
+        print(f"\nCaptured {len(self.saved_detections)} detection(s) for sequential movement")
+        
+        # Define home position [0, 90, -90, -90] degrees
+        home_position = [0.0, np.pi/2, -np.pi/2, -np.pi/2]
+        
+        # Move to each detection sequentially
+        for idx, detection in enumerate(self.saved_detections):
+            print(f"\n--- Moving to detection #{idx + 1}/{len(self.saved_detections)} ---")
+            
+            try:
+                # Use position reconstructor to get target position
+                result = self.position_reconstructor.reconstruct_position(
+                    detection, 
+                    hover_height=25.0,
+                    table_z=0.0
+                )
+                
+                if result is None:
+                    print(f"Failed to reconstruct position for detection #{idx + 1}, skipping...")
+                    continue
+                
+                target_position, debug_info = result
+                
+                # Log debug information
+                debug_str = self.position_reconstructor.format_debug_info(debug_info, idx + 1)
+                print(debug_str)
+                
+                # Move robot to target position using IK (with wait=True for sequential movement)
+                if self.robot.move_to_position(
+                    target_position[0], 
+                    target_position[1], 
+                    target_position[2], 
+                    x4z_desired=-1.0, 
+                    prefer_elbow_up=True, 
+                    wait=True  # Wait for this movement to complete before moving to next
+                ):
+                    print(f"Successfully moved to detection #{idx + 1}")
+                    time.sleep(2.0)  # Wait 2 seconds at detection position
+                    
+                    # Return to home position between detections
+                    print(f"Returning to home position...")
+                    if self.robot.set_joint_positions(home_position, wait=True):
+                        print(f"Returned to home position")
+                        time.sleep(2.0)  # Wait 2 seconds at home position
+                    else:
+                        print(f"Warning: Failed to return to home position")
+                else:
+                    print(f"Failed to move to detection #{idx + 1} (position may be unreachable)")
+                    
+            except Exception as e:
+                print(f"Error moving to detection #{idx + 1}: {str(e)}")
+                continue
+        
+        print(f"\nCompleted sequential movement to all {len(self.saved_detections)} detections")
+        QMessageBox.information(self, "Movement Complete", 
+            f"Successfully processed {len(self.saved_detections)} detection(s)")
+    
+    def move_to_detection(self):
+        """Move the robot stylus to a detected object position."""
+        if not self.robot or not self.robot.is_initialized:
+            print("Robot not connected or initialized!")
+            QMessageBox.warning(self, "Not Connected", "Please connect and initialize the robot first.")
+            return
+        
+        if not self.position_reconstructor:
+            print("Position reconstructor not initialized!")
+            return
+        
+        if not self.current_detections:
+            print("No detections available!")
             QMessageBox.warning(self, "No Detections", "No objects detected. Enable detection first.")
             return
         
         detection_idx = self.detection_index_spinbox.value() - 1  # Convert to 0-based index
         
         if detection_idx >= len(self.current_detections):
-            self.log(f"Detection #{detection_idx + 1} not available!")
+            print(f"Detection #{detection_idx + 1} not available!")
             return
         
         try:
-            x_pixel, y_pixel, r, world_coords = self.current_detections[detection_idx]
-            print(f"World coords from detection: {world_coords}")
-            if world_coords is None:
-                self.log("World coordinates not available for this detection!")
-                QMessageBox.warning(self, "No Coordinates", 
-                    "World coordinates not available. Make sure camera height is set.")
+            detection = self.current_detections[detection_idx]
+            
+            # Use position reconstructor to get target position
+            result = self.position_reconstructor.reconstruct_position(
+                detection, 
+                hover_height=25.0,  # 20mm above table
+                table_z=0.0  # Table at Z=0 in base frame
+            )
+            
+            if result is None:
+                print("Failed to reconstruct position for this detection!")
+                QMessageBox.warning(self, "Reconstruction Failed", 
+                    "Could not determine 3D position. Check camera calibration and robot connection.")
                 return
             
-            wx, wy = world_coords
+            target_position, debug_info = result
             
-            # Step 1: Get current camera position and orientation from robot FK
-            camera_pos, camera_rot = self.robot.get_camera_position()
-            print(f"Camera position: {camera_pos}, rotation:\n{camera_rot}")
-            if camera_pos is None:
-                self.log("Failed to get camera position from robot!")
-                return
-            
-            camera_height = camera_pos[2]  # Z coordinate of camera in base frame
-            
-            self.log(f"Detection #{detection_idx + 1}:")
-            self.log(f"  Pixel coords: ({int(x_pixel)}, {int(y_pixel)})")
-            self.log(f"  Camera frame coords from pinhole: ({wx:.1f}, {wy:.1f}) mm")
-            self.log(f"  Camera position in base: ({camera_pos[0]:.1f}, {camera_pos[1]:.1f}, {camera_pos[2]:.1f}) mm")
-            self.log(f"  Camera rotation matrix:\n{camera_rot}")
-            
-            # Step 2: Build 3D point in camera frame
-            # Due to the camera's physical mounting orientation, we need to swap coordinates
-            # The rotation matrix shows the camera frame is rotated relative to the stylus frame
-            camera_coords = np.array([camera_height, -wy, wx])
-            # camera_coords = np.array([camera_height, 0, 0])
-            
-            print(f"Camera frame coords: {camera_coords}")
-            self.log(f"  Object in camera frame: ({camera_height:.1f}, {wy:.1f}, {wx:.1f}) mm")
-            
-            # Step 3: Transform from camera frame to base frame using the kinematic chain
-            base_coords = self.robot.camera_to_base_frame(camera_coords)
-            base_coords[1] = -1*base_coords[1]
-
-            print(f"Base frame coords: {base_coords}")
+            # Log debug information
+            debug_str = self.position_reconstructor.format_debug_info(debug_info, detection_idx + 1)
+            print(debug_str)
             # return
-            if base_coords is None:
-                self.log("Failed to transform coordinates to base frame!")
-                return
-            
-            self.log(f"  Object in base frame (raw): ({base_coords[0]:.1f}, {base_coords[1]:.1f}, {base_coords[2]:.1f}) mm")
-            
-            # Step 4: The object should be on the table (Z=0 in base frame for table surface)
-            # But base_coords[2] might not be 0 due to transformation issues
-            # Let's set Z=0 for table surface, then add 20mm hover offset
-            table_z = 0.0
-            target_z = table_z+20.0  # 20mm above table
-            
-            # Use XY from transformation, but override Z to be just above table
-            base_coords[2] = target_z
-            
-            self.log(f"  Target in base frame (20mm above table): ({base_coords[0]:.1f}, {base_coords[1]:.1f}, {base_coords[2]:.1f}) mm")
-            
-            # Step 5: Move robot to target position using IK
-            if self.robot.move_to_position(base_coords[0], base_coords[1], base_coords[2], 
-                                          x4z_desired=-1.0, solution_index=0, wait=False):
-                self.log(f"Successfully commanded move to detection #{detection_idx + 1}")
+        
+            # Move robot to target position using IK
+            if self.robot.move_to_position(
+                target_position[0], 
+                target_position[1], 
+                target_position[2], 
+                x4z_desired=-1.0, 
+                prefer_elbow_up=True, 
+                wait=False
+            ):
+                print(f"Successfully commanded move to detection #{detection_idx + 1}")
             else:
-                self.log(f"Failed to move to detection #{detection_idx + 1} (position may be unreachable)")
+                print(f"Failed to move to detection #{detection_idx + 1} (position may be unreachable)")
                 QMessageBox.warning(self, "Move Failed", 
                     "Failed to move to detection. Position may be out of reach.")
                 
         except Exception as e:
-            self.log(f"Error moving to detection: {str(e)}")
+            print(f"Error moving to detection: {str(e)}")
             QMessageBox.critical(self, "Movement Error", str(e))
     
     def closeEvent(self, event):

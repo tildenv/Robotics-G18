@@ -68,7 +68,7 @@ class ObjectDetector:
         val = img[:, :, 2]
 
         # Red is near 0 or 1 in hue space (wraps around)
-        mask = ((hue < 0.05) | (hue > 0.95)) & (sat > 0.35) & (val > 0.2)
+        mask = ((hue < 0.10) | (hue > 0.95)) & (sat > 0.35) & (val > 0.2)
         mask = img_as_ubyte(mask)
 
         # Remove noise
