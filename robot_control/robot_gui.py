@@ -5,16 +5,29 @@ A PyQt5-based graphical interface for controlling the robot arm.
 """
 
 import sys
+import os
+
+# Fix Qt plugin conflict between OpenCV and PyQt5
+# Must be set before importing any Qt or cv2 modules
+os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH", None)
+if "cv2" in sys.modules:
+    del sys.modules["cv2"]
+
 import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLabel, QLineEdit, QPushButton, QTextEdit, QDoubleSpinBox,
-    QSpinBox, QTabWidget, QGridLayout, QMessageBox, QSlider
+    QSpinBox, QTabWidget, QGridLayout, QMessageBox, QSlider, QFileDialog
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont
-from robot_control.robot_controller import RobotController
+from PyQt5.QtGui import QFont, QImage, QPixmap
+from robot_controller import RobotController
 import math
+# Import cv2 with headless backend to avoid Qt conflicts
+os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
+import cv2
+from datetime import datetime
+from object_detection import ObjectDetector
 
 
 class RobotGUI(QMainWindow):
@@ -24,6 +37,15 @@ class RobotGUI(QMainWindow):
         super().__init__()
         self.robot = None
         self.realtime_update_enabled = False
+        self.camera = None
+        self.camera_active = False
+        self.detector = ObjectDetector(calibration_file='./photos/camera_calibration_data.npz')
+        self.detection_enabled = False
+        self.current_detections = []
+        # Camera to stylus transformation (inverse of stylus to camera)
+        # Original: T_stylus_camera = [[1,0,0,-15], [0,1,0,45], [0,0,1,0], [0,0,0,1]]
+        # Inverted: T_camera_stylus
+        self.camera_to_stylus_offset = np.array([15.0, -45.0, 0.0])  # mm
         self.init_ui()
         
     def init_ui(self):
@@ -58,6 +80,10 @@ class RobotGUI(QMainWindow):
         # Real-time Control Tab
         realtime_tab = self.create_realtime_control_tab()
         tab_widget.addTab(realtime_tab, "Real-time Control")
+        
+        # Camera Tab
+        camera_tab = self.create_camera_tab()
+        tab_widget.addTab(camera_tab, "Camera")
         
         main_layout.addWidget(tab_widget)
         
@@ -117,28 +143,31 @@ class RobotGUI(QMainWindow):
         layout = QVBoxLayout()
         
         # Joint angle inputs
-        joint_group = QGroupBox("Joint Angles (radians)")
+        joint_group = QGroupBox("Joint Angles (degrees)")
         joint_layout = QGridLayout()
         
         self.joint_spinboxes = []
         for i in range(4):
             label = QLabel(f"Joint {i+1}:")
             spinbox = QDoubleSpinBox()
-            spinbox.setRange(-np.pi, np.pi)
-            spinbox.setSingleStep(0.1)
-            spinbox.setDecimals(4)
+            spinbox.setRange(-180, 180)
+            spinbox.setSingleStep(1.0)
+            spinbox.setDecimals(2)
             spinbox.setValue(0.0)
+            spinbox.setWrapping(False)
+            spinbox.setKeyboardTracking(True)
+            spinbox.setSuffix("°")
             self.joint_spinboxes.append(spinbox)
             
             joint_layout.addWidget(label, i, 0)
             joint_layout.addWidget(spinbox, i, 1)
             
-            # Add degree display
-            deg_label = QLabel("0.00°")
+            # Add radian display
+            rad_label = QLabel("0.0000 rad")
             spinbox.valueChanged.connect(
-                lambda val, lbl=deg_label: lbl.setText(f"{np.degrees(val):.2f}°")
+                lambda val, lbl=rad_label: lbl.setText(f"{np.radians(val):.4f} rad")
             )
-            joint_layout.addWidget(deg_label, i, 2)
+            joint_layout.addWidget(rad_label, i, 2)
         
         joint_group.setLayout(joint_layout)
         layout.addWidget(joint_group)
@@ -463,6 +492,128 @@ class RobotGUI(QMainWindow):
         layout.addStretch()
         widget.setLayout(layout)
         return widget
+    
+    def create_camera_tab(self):
+        """Create camera control tab."""
+        widget = QWidget()
+        layout = QVBoxLayout()
+        
+        # Camera control
+        camera_control_group = QGroupBox("Camera Control")
+        camera_control_layout = QHBoxLayout()
+        
+        # Camera device selector
+        camera_control_layout.addWidget(QLabel("Camera Device:"))
+        self.camera_device_spinbox = QSpinBox()
+        self.camera_device_spinbox.setRange(0, 10)
+        self.camera_device_spinbox.setValue(2)
+        camera_control_layout.addWidget(self.camera_device_spinbox)
+        
+        detect_btn = QPushButton("Detect Cameras")
+        detect_btn.clicked.connect(self.detect_cameras)
+        camera_control_layout.addWidget(detect_btn)
+        
+        self.camera_open_btn = QPushButton("Open Camera")
+        self.camera_open_btn.clicked.connect(self.open_camera)
+        camera_control_layout.addWidget(self.camera_open_btn)
+        
+        self.camera_close_btn = QPushButton("Close Camera")
+        self.camera_close_btn.clicked.connect(self.close_camera)
+        self.camera_close_btn.setEnabled(False)
+        camera_control_layout.addWidget(self.camera_close_btn)
+        
+        camera_control_layout.addStretch()
+        camera_control_group.setLayout(camera_control_layout)
+        layout.addWidget(camera_control_group)
+        
+        # Detection control
+        detection_control_group = QGroupBox("Object Detection")
+        detection_control_layout = QHBoxLayout()
+        
+        self.detection_toggle_btn = QPushButton("Enable Detection")
+        self.detection_toggle_btn.clicked.connect(self.toggle_detection)
+        self.detection_toggle_btn.setEnabled(False)
+        detection_control_layout.addWidget(self.detection_toggle_btn)
+        
+        detection_control_layout.addWidget(QLabel("Camera height is automatically set from robot position"))
+        
+        detection_control_layout.addStretch()
+        detection_control_group.setLayout(detection_control_layout)
+        layout.addWidget(detection_control_group)
+        
+        # Detection list
+        detection_list_group = QGroupBox("Detected Objects")
+        detection_list_layout = QVBoxLayout()
+        
+        self.detection_list = QTextEdit()
+        self.detection_list.setReadOnly(True)
+        self.detection_list.setMaximumHeight(150)
+        font = QFont("Courier New", 9)
+        self.detection_list.setFont(font)
+        self.detection_list.setText("No detections yet")
+        detection_list_layout.addWidget(self.detection_list)
+        
+        # Move to detection controls
+        move_detection_layout = QHBoxLayout()
+        move_detection_layout.addWidget(QLabel("Move to Detection #:"))
+        self.detection_index_spinbox = QSpinBox()
+        self.detection_index_spinbox.setRange(1, 10)
+        self.detection_index_spinbox.setValue(1)
+        move_detection_layout.addWidget(self.detection_index_spinbox)
+        
+        move_to_detection_btn = QPushButton("Move Stylus to Detection")
+        move_to_detection_btn.clicked.connect(self.move_to_detection)
+        move_detection_layout.addWidget(move_to_detection_btn)
+        
+        move_detection_layout.addStretch()
+        detection_list_layout.addLayout(move_detection_layout)
+        
+        detection_list_group.setLayout(detection_list_layout)
+        layout.addWidget(detection_list_group)
+        
+        # Camera preview
+        preview_group = QGroupBox("Camera Preview")
+        preview_layout = QVBoxLayout()
+        
+        self.camera_preview_label = QLabel("Camera not active")
+        self.camera_preview_label.setAlignment(Qt.AlignCenter)
+        self.camera_preview_label.setMinimumSize(640, 480)
+        self.camera_preview_label.setStyleSheet("border: 1px solid black; background-color: #2b2b2b;")
+        preview_layout.addWidget(self.camera_preview_label)
+        
+        preview_group.setLayout(preview_layout)
+        layout.addWidget(preview_group)
+        
+        # Photo capture
+        capture_group = QGroupBox("Photo Capture")
+        capture_layout = QHBoxLayout()
+        
+        self.capture_btn = QPushButton("Take Photo")
+        self.capture_btn.clicked.connect(self.take_photo)
+        self.capture_btn.setEnabled(False)
+        capture_layout.addWidget(self.capture_btn)
+        
+        self.save_location_label = QLabel("Save to: ./photos/")
+        capture_layout.addWidget(self.save_location_label)
+        
+        change_location_btn = QPushButton("Change Location")
+        change_location_btn.clicked.connect(self.change_save_location)
+        capture_layout.addWidget(change_location_btn)
+        
+        capture_layout.addStretch()
+        capture_group.setLayout(capture_layout)
+        layout.addWidget(capture_group)
+        
+        # Set up timer for camera updates
+        self.camera_timer = QTimer()
+        self.camera_timer.timeout.connect(self.update_camera_frame)
+        
+        # Default save location
+        self.save_location = "./photos"
+        
+        layout.addStretch()
+        widget.setLayout(layout)
+        return widget
         
     def toggle_realtime_control(self):
         """Enable or disable real-time control."""
@@ -635,7 +786,7 @@ class RobotGUI(QMainWindow):
             
             if self.robot.connect():
                 self.log("Connected successfully!")
-                if self.robot.initialize(compliance_margin=0, compliance_slope=32, moving_speed=100):
+                if self.robot.initialize(compliance_margin=0, compliance_slope=32, moving_speed=50):
                     self.log("Robot initialized successfully!")
                     self.connect_btn.setEnabled(False)
                     self.disconnect_btn.setEnabled(True)
@@ -668,10 +819,11 @@ class RobotGUI(QMainWindow):
             return
             
         try:
-            angles = [spinbox.value() for spinbox in self.joint_spinboxes]
-            self.log(f"Moving to joint angles: {[f'{np.degrees(a):.2f}°' for a in angles]}")
+            angles_deg = [spinbox.value() for spinbox in self.joint_spinboxes]
+            angles_rad = [np.radians(deg) for deg in angles_deg]
+            self.log(f"Moving to joint angles: {[f'{a:.2f}°' for a in angles_deg]}")
             
-            if self.robot.set_joint_positions(angles, wait=wait):
+            if self.robot.set_joint_positions(angles_rad, wait=wait):
                 self.log("Joint movement command sent successfully.")
             else:
                 self.log("Failed to send joint movement command.")
@@ -687,22 +839,24 @@ class RobotGUI(QMainWindow):
             return
             
         try:
-            angles = self.robot.get_joint_positions()
-            if angles is not None:
-                for i, (spinbox, angle) in enumerate(zip(self.joint_spinboxes, angles)):
-                    spinbox.setValue(angle)
-                self.log(f"Read joint angles: {[f'{np.degrees(a):.2f}°' for a in angles]}")
+            angles_rad = self.robot.get_joint_positions()
+            if angles_rad is not None:
+                angles_deg = [np.degrees(a) for a in angles_rad]
+                for i, (spinbox, angle_deg) in enumerate(zip(self.joint_spinboxes, angles_deg)):
+                    spinbox.setValue(angle_deg)
+                self.log(f"Read joint angles: {[f'{a:.2f}°' for a in angles_deg]}")
             else:
                 self.log("Failed to read joint angles.")
                 
         except Exception as e:
             self.log(f"Error reading joint angles: {str(e)}")
             
-    def set_preset(self, angles):
-        """Set spinboxes to preset angles."""
-        for spinbox, angle in zip(self.joint_spinboxes, angles):
-            spinbox.setValue(angle)
-        self.log(f"Set preset angles: {[f'{np.degrees(a):.2f}°' for a in angles]}")
+    def set_preset(self, angles_rad):
+        """Set spinboxes to preset angles (input in radians, converted to degrees for display)."""
+        angles_deg = [np.degrees(a) for a in angles_rad]
+        for spinbox, angle_deg in zip(self.joint_spinboxes, angles_deg):
+            spinbox.setValue(angle_deg)
+        self.log(f"Set preset angles: {[f'{a:.2f}°' for a in angles_deg]}")
         
     def move_cartesian(self, wait=False):
         """Move robot to specified Cartesian position using IK."""
@@ -852,8 +1006,312 @@ class RobotGUI(QMainWindow):
         except Exception as e:
             self.log(f"Error setting speed: {str(e)}")
             
+    def detect_cameras(self):
+        """Detect available camera devices."""
+        self.log("Detecting available cameras...")
+        available = []
+        
+        # Test camera indices 0-10
+        for i in range(11):
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                available.append(i)
+                cap.release()
+        
+        if available:
+            self.log(f"Found {len(available)} camera(s): {available}")
+            # Set to first available camera
+            self.camera_device_spinbox.setValue(available[0])
+            QMessageBox.information(self, "Cameras Detected", 
+                f"Found camera devices at indices: {available}\n\nCamera device selector updated to: {available[0]}")
+        else:
+            self.log("No cameras detected")
+            QMessageBox.warning(self, "No Cameras", "No camera devices were detected.")
+    
+    def open_camera(self):
+        """Open the camera for preview."""
+        try:
+            device_id = self.camera_device_spinbox.value()
+            # Try as string first (some systems need this), then as int
+            self.camera = cv2.VideoCapture(str(device_id))
+            if not self.camera.isOpened():
+                # Fallback to integer if string didn't work
+                self.camera = cv2.VideoCapture(device_id)
+            
+            if not self.camera.isOpened():
+                self.log(f"Failed to open camera (device {device_id})")
+                QMessageBox.warning(self, "Camera Error", 
+                    f"Failed to open camera device {device_id}.\n\nTry clicking 'Detect Cameras' to find available devices.")
+                self.camera = None
+                return
+            
+            self.camera_active = True
+            self.camera_open_btn.setEnabled(False)
+            self.camera_close_btn.setEnabled(True)
+            self.capture_btn.setEnabled(True)
+            self.detection_toggle_btn.setEnabled(True)
+            self.camera_timer.start(30)  # Update every 30ms (~33 FPS)
+            self.log("Camera opened successfully")
+            
+        except Exception as e:
+            self.log(f"Error opening camera: {str(e)}")
+            QMessageBox.critical(self, "Camera Error", str(e))
+    
+    def close_camera(self):
+        """Close the camera."""
+        try:
+            self.camera_active = False
+            self.camera_timer.stop()
+            
+            if self.camera:
+                self.camera.release()
+                self.camera = None
+            
+            self.camera_preview_label.setText("Camera not active")
+            self.camera_open_btn.setEnabled(True)
+            self.camera_close_btn.setEnabled(False)
+            self.capture_btn.setEnabled(False)
+            self.detection_enabled = False
+            self.detection_toggle_btn.setEnabled(False)
+            self.detection_toggle_btn.setText("Enable Detection")
+            self.log("Camera closed")
+            
+        except Exception as e:
+            self.log(f"Error closing camera: {str(e)}")
+    
+    def update_camera_frame(self):
+        """Update the camera preview frame."""
+        if not self.camera_active or not self.camera:
+            return
+        
+        try:
+            ret, frame = self.camera.read()
+            if ret:
+                # Run detection if enabled
+                if self.detection_enabled:
+                    # Update camera height from robot FK if robot is connected
+                    if self.robot and self.robot.is_connected:
+                        pos, rot = self.robot.get_camera_position()
+                        if pos is not None:
+                            camera_height = pos[2]  # Z coordinate
+                            self.detector.set_camera_height(camera_height)
+                    
+                    detections, mask = self.detector.detect_objects_with_positions(frame, use_hsv=True)
+                    
+                    # Store detections
+                    self.current_detections = detections
+                    self.update_detection_list()
+                    
+                    # Draw detections on frame
+                    for i, (x, y, r, world_coords) in enumerate(detections, start=1):
+                        # Draw circle and center point
+                        cv2.circle(frame, (int(x), int(y)), int(r), (0, 255, 0), 2)
+                        cv2.circle(frame, (int(x), int(y)), 2, (0, 255, 0), -1)
+                        
+                        # Display pixel coordinates
+                        text = f"#{i} ({int(x)},{int(y)})"
+                        cv2.putText(frame, text, (int(x)+6, int(y)-6), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+                        
+                        # Display world coordinates if available
+                        if world_coords is not None:
+                            wx, wy = world_coords
+                            text_world = f"World: ({wx:.1f}, {wy:.1f})"
+                            cv2.putText(frame, text_world, (int(x)+6, int(y)+12), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+                    
+                    # Add detection count
+                    count_text = f"Detections: {len(detections)}"
+                    cv2.putText(frame, count_text, (10, 30), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+                
+                # Convert frame to Qt format
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = frame_rgb.shape
+                bytes_per_line = ch * w
+                qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                
+                # Scale to fit the label while maintaining aspect ratio
+                pixmap = QPixmap.fromImage(qt_image)
+                scaled_pixmap = pixmap.scaled(
+                    self.camera_preview_label.width(),
+                    self.camera_preview_label.height(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+                self.camera_preview_label.setPixmap(scaled_pixmap)
+            
+        except Exception as e:
+            self.log(f"Error updating camera frame: {str(e)}")
+    
+    def take_photo(self):
+        """Capture and save a photo from the camera."""
+        if not self.camera_active or not self.camera:
+            self.log("Camera not active")
+            return
+        
+        try:
+            ret, frame = self.camera.read()
+            if not ret:
+                self.log("Failed to capture frame")
+                QMessageBox.warning(self, "Capture Error", "Failed to capture frame from camera")
+                return
+            
+            # Create save directory if it doesn't exist
+            os.makedirs(self.save_location, exist_ok=True)
+            
+            # Generate filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = os.path.join(self.save_location, f"photo_{timestamp}.jpg")
+            
+            # Save the image
+            cv2.imwrite(filename, frame)
+            self.log(f"Photo saved: {filename}")
+            QMessageBox.information(self, "Photo Saved", f"Photo saved successfully:\n{filename}")
+            
+        except Exception as e:
+            self.log(f"Error taking photo: {str(e)}")
+            QMessageBox.critical(self, "Capture Error", str(e))
+    
+    def change_save_location(self):
+        """Change the directory where photos are saved."""
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Photo Save Location",
+            self.save_location,
+            QFileDialog.ShowDirsOnly
+        )
+        
+        if directory:
+            self.save_location = directory
+            self.save_location_label.setText(f"Save to: {directory}")
+            self.log(f"Photo save location changed to: {directory}")
+    
+    def toggle_detection(self):
+        """Toggle object detection on/off."""
+        self.detection_enabled = not self.detection_enabled
+        
+        if self.detection_enabled:
+            self.detection_toggle_btn.setText("Disable Detection")
+            self.detection_toggle_btn.setStyleSheet("background-color: #90EE90;")
+            self.log("Object detection ENABLED - Camera height will be automatically updated from robot position")
+        else:
+            self.detection_toggle_btn.setText("Enable Detection")
+            self.detection_toggle_btn.setStyleSheet("")
+            self.log("Object detection DISABLED")
+    
+    def update_detection_list(self):
+        """Update the detection list display."""
+        if not self.current_detections:
+            self.detection_list.setText("No detections")
+            return
+        
+        text = f"Total Detections: {len(self.current_detections)}\n"
+        text += "="*60 + "\n"
+        text += f"{'#':<3} {'Pixel X':<8} {'Pixel Y':<8} {'Radius':<8} {'World X':<10} {'World Y':<10}\n"
+        text += "-"*60 + "\n"
+        
+        for i, (x, y, r, world_coords) in enumerate(self.current_detections, start=1):
+            if world_coords is not None:
+                wx, wy = world_coords
+                text += f"{i:<3} {int(x):<8} {int(y):<8} {int(r):<8} {wx:<10.1f} {wy:<10.1f}\n"
+            else:
+                text += f"{i:<3} {int(x):<8} {int(y):<8} {int(r):<8} {'N/A':<10} {'N/A':<10}\n"
+        
+        self.detection_list.setText(text)
+        self.detection_index_spinbox.setRange(1, len(self.current_detections))
+    
+    def move_to_detection(self):
+        """Move the robot stylus to a detected object position."""
+        if not self.robot or not self.robot.is_initialized:
+            self.log("Robot not connected or initialized!")
+            QMessageBox.warning(self, "Not Connected", "Please connect and initialize the robot first.")
+            return
+        
+        if not self.current_detections:
+            self.log("No detections available!")
+            QMessageBox.warning(self, "No Detections", "No objects detected. Enable detection first.")
+            return
+        
+        detection_idx = self.detection_index_spinbox.value() - 1  # Convert to 0-based index
+        
+        if detection_idx >= len(self.current_detections):
+            self.log(f"Detection #{detection_idx + 1} not available!")
+            return
+        
+        try:
+            x_pixel, y_pixel, r, world_coords = self.current_detections[detection_idx]
+            print(f"World coords from detection: {world_coords}")
+            if world_coords is None:
+                self.log("World coordinates not available for this detection!")
+                QMessageBox.warning(self, "No Coordinates", 
+                    "World coordinates not available. Make sure camera height is set.")
+                return
+            
+            wx, wy = world_coords
+            
+            # Step 1: Get current camera position and orientation from robot FK
+            camera_pos, camera_rot = self.robot.get_camera_position()
+            print(f"Camera position: {camera_pos}, rotation:\n{camera_rot}")
+            if camera_pos is None:
+                self.log("Failed to get camera position from robot!")
+                return
+            
+            camera_height = camera_pos[2]  # Z coordinate of camera in base frame
+            
+            self.log(f"Detection #{detection_idx + 1}:")
+            self.log(f"  Pixel coords: ({int(x_pixel)}, {int(y_pixel)})")
+            self.log(f"  Camera frame coords from pinhole: ({wx:.1f}, {wy:.1f}) mm")
+            self.log(f"  Camera position in base: ({camera_pos[0]:.1f}, {camera_pos[1]:.1f}, {camera_pos[2]:.1f}) mm")
+            self.log(f"  Camera rotation matrix:\n{camera_rot}")
+            
+            # Step 2: Build 3D point in camera frame
+            # Due to the camera's physical mounting orientation, we need to swap coordinates
+            # The rotation matrix shows the camera frame is rotated relative to the stylus frame
+            camera_coords = np.array([camera_height, wx, wy])
+            
+            print(f"Camera frame coords: {camera_coords}")
+            self.log(f"  Object in camera frame: ({camera_height:.1f}, {wy:.1f}, {wx:.1f}) mm")
+            
+            # Step 3: Transform from camera frame to base frame using the kinematic chain
+            base_coords = self.robot.camera_to_base_frame(camera_coords)
+            print(f"Base frame coords: {base_coords}")
+            if base_coords is None:
+                self.log("Failed to transform coordinates to base frame!")
+                return
+            
+            self.log(f"  Object in base frame (raw): ({base_coords[0]:.1f}, {base_coords[1]:.1f}, {base_coords[2]:.1f}) mm")
+            
+            # Step 4: The object should be on the table (Z=0 in base frame for table surface)
+            # But base_coords[2] might not be 0 due to transformation issues
+            # Let's set Z=0 for table surface, then add 20mm hover offset
+            table_z = 0.0
+            target_z = table_z + 20.0  # 20mm above table
+            
+            # Use XY from transformation, but override Z to be just above table
+            base_coords[2] = target_z
+            
+            self.log(f"  Target in base frame (20mm above table): ({base_coords[0]:.1f}, {base_coords[1]:.1f}, {base_coords[2]:.1f}) mm")
+            
+            # Step 5: Move robot to target position using IK
+            if self.robot.move_to_position(base_coords[0], base_coords[1], base_coords[2], 
+                                          x4z_desired=-1.0, solution_index=0, wait=False):
+                self.log(f"Successfully commanded move to detection #{detection_idx + 1}")
+            else:
+                self.log(f"Failed to move to detection #{detection_idx + 1} (position may be unreachable)")
+                QMessageBox.warning(self, "Move Failed", 
+                    "Failed to move to detection. Position may be out of reach.")
+                
+        except Exception as e:
+            self.log(f"Error moving to detection: {str(e)}")
+            QMessageBox.critical(self, "Movement Error", str(e))
+    
     def closeEvent(self, event):
         """Handle window close event."""
+        # Close camera if active
+        if self.camera_active:
+            self.close_camera()
+        
         if self.robot and self.robot.is_connected:
             reply = QMessageBox.question(
                 self, 'Confirm Exit',

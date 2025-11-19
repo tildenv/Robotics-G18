@@ -109,7 +109,7 @@ class RobotController:
     def initialize(self, 
                    compliance_margin: int = 0,
                    compliance_slope: int = 32,
-                   moving_speed: int = 100) -> bool:
+                   moving_speed: int = 50) -> bool:
         """
         Initialize all motors with torque enabled and compliance settings.
         
@@ -700,6 +700,167 @@ class RobotController:
         rotation = T0_4[:3, :3]
         
         return position, rotation
+    
+    def get_camera_position(self, q_radians: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute forward kinematics to get camera position and orientation.
+        
+        Extends the stylus FK by applying the stylus-to-camera transformation.
+        The transformation from stylus to camera is:
+        T_stylus_camera = [[1, 0, 0, -15], [0, 1, 0, 45], [0, 0, 1, 0], [0, 0, 0, 1]]
+        
+        Args:
+            q_radians: Joint angles in radians. If None, reads current positions.
+            
+        Returns:
+            Tuple of (position, rotation_matrix):
+                - position: [x, y, z] in mm (camera position in base frame)
+                - rotation_matrix: 3x3 rotation matrix of camera frame
+        """
+        if q_radians is None:
+            q_radians = self.get_joint_positions()
+            if q_radians is None:
+                return None, None
+        
+        q1, q2, q3, q4 = q_radians
+        
+        # Compute transformation matrices using DH parameters (base to stylus)
+        # A1 = DH(q1, L1, 0, pi/2)
+        c1, s1 = math.cos(q1), math.sin(q1)
+        A1 = np.array([
+            [c1, 0, s1, 0],
+            [s1, 0, -c1, 0],
+            [0, 1, 0, self.L1],
+            [0, 0, 0, 1]
+        ])
+        
+        # A2 = DH(q2, 0, L2, 0)
+        c2, s2 = math.cos(q2), math.sin(q2)
+        A2 = np.array([
+            [c2, -s2, 0, self.L2*c2],
+            [s2, c2, 0, self.L2*s2],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        
+        # A3 = DH(q3, 0, L3, 0)
+        c3, s3 = math.cos(q3), math.sin(q3)
+        A3 = np.array([
+            [c3, -s3, 0, self.L3*c3],
+            [s3, c3, 0, self.L3*s3],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        
+        # A4 = DH(q4, 0, L4, 0)
+        c4, s4 = math.cos(q4), math.sin(q4)
+        A4 = np.array([
+            [c4, -s4, 0, self.L4*c4],
+            [s4, c4, 0, self.L4*s4],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        
+        # Compute T_base_stylus = A1 @ A2 @ A3 @ A4
+        T_base_stylus = A1 @ A2 @ A3 @ A4
+        
+        # Transformation from stylus to camera (A5)
+        T_stylus_camera = np.array([
+            [1, 0, 0, -15],
+            [0, 1, 0, 45],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=float)
+        
+        # Complete transformation from base to camera
+        T_base_camera = T_base_stylus @ T_stylus_camera
+        
+        position = T_base_camera[:3, 3]
+        rotation = T_base_camera[:3, :3]
+        
+        return position, rotation
+    
+    def camera_to_base_frame(self, camera_coords: np.ndarray, q_radians: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Transform coordinates from camera frame to robot base frame.
+        
+        Uses the complete kinematic chain: Base -> Stylus -> Camera
+        The transformation from stylus to camera is:
+        T_stylus_camera = [[1, 0, 0, -15], [0, 1, 0, 45], [0, 0, 1, 0], [0, 0, 0, 1]]
+        
+        Args:
+            camera_coords: 3D coordinates in camera frame [x, y, z] in mm
+            q_radians: Joint angles in radians. If None, reads current positions.
+            
+        Returns:
+            np.ndarray: 3D coordinates in robot base frame [x, y, z] in mm
+        """
+        if q_radians is None:
+            q_radians = self.get_joint_positions()
+            if q_radians is None:
+                return None
+        
+        q1, q2, q3, q4 = q_radians
+        
+        # Compute transformation matrices using DH parameters (base to stylus)
+        # A1 = DH(q1, L1, 0, pi/2)
+        c1, s1 = math.cos(q1), math.sin(q1)
+        A1 = np.array([
+            [c1, 0, s1, 0],
+            [s1, 0, -c1, 0],
+            [0, 1, 0, self.L1],
+            [0, 0, 0, 1]
+        ])
+        
+        # A2 = DH(q2, 0, L2, 0)
+        c2, s2 = math.cos(q2), math.sin(q2)
+        A2 = np.array([
+            [c2, -s2, 0, self.L2*c2],
+            [s2, c2, 0, self.L2*s2],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        
+        # A3 = DH(q3, 0, L3, 0)
+        c3, s3 = math.cos(q3), math.sin(q3)
+        A3 = np.array([
+            [c3, -s3, 0, self.L3*c3],
+            [s3, c3, 0, self.L3*s3],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        
+        # A4 = DH(q4, 0, L4, 0)
+        c4, s4 = math.cos(q4), math.sin(q4)
+        A4 = np.array([
+            [c4, -s4, 0, self.L4*c4],
+            [s4, c4, 0, self.L4*s4],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ])
+        
+        # Compute T_base_stylus = A1 @ A2 @ A3 @ A4
+        T_base_stylus = A1 @ A2 @ A3 @ A4
+        
+        # Transformation from stylus to camera (A5)
+        T_stylus_camera = np.array([
+            [1, 0, 0, -15],
+            [0, 1, 0, 45],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=float)
+        
+        # Complete transformation from base to camera
+        T_base_camera = T_base_stylus @ T_stylus_camera
+        
+        # Convert camera coordinates to homogeneous coordinates
+        camera_coords_homogeneous = np.append(camera_coords, 1.0)
+        
+        # Transform to base frame
+        base_coords_homogeneous = T_base_camera @ camera_coords_homogeneous
+        
+        # Return 3D coordinates (drop homogeneous coordinate)
+        return base_coords_homogeneous[:3]
     
     def print_status(self):
         """Print current robot status."""
